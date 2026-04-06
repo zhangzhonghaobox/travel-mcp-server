@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse, Response
 from sse_starlette.sse import EventSourceResponse
 
 from travel_mcp.config import get_config
-from travel_mcp.core.error_handler import ErrorResponse, ErrorCode as TravelErrorCode
 
 
 class SSEServerTransport:
@@ -121,16 +120,25 @@ class SSEServerTransport:
             try:
                 mcp_server = get_mcp_server()
                 if mcp_server:
-                    tools = []
-                    for tool in mcp_server._tools.values():
-                        tools.append({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.input_schema
-                        })
-                    return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
-            except Exception:
-                pass
+                    # Use the shared implementation from TravelMCPServer
+                    result = await mcp_server.list_tools_impl()
+                    # Convert ListToolsResult to dict format for JSON-RPC
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "inputSchema": t.inputSchema
+                                }
+                                for t in result.tools
+                            ]
+                        }
+                    }
+            except Exception as e:
+                return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(e)}}
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": []}}
 
         elif method == "tools/call":
@@ -138,18 +146,17 @@ class SSEServerTransport:
             tool_args = params.get("arguments", {})
             try:
                 mcp_server = get_mcp_server()
-                if mcp_server and tool_name in mcp_server._tools:
-                    from travel_mcp.tools.base import ToolExecutionContext
-                    context = ToolExecutionContext(
-                        request_id=f"{session_id}_{msg_id}",
-                        tool_name=tool_name,
-                        arguments=tool_args
-                    )
-                    result = await mcp_server._tools[tool_name].execute(context)
+                if mcp_server:
+                    # Use the shared implementation from TravelMCPServer
+                    result = await mcp_server.call_tool_impl(tool_name, tool_args)
+                    # Convert CallToolResult to dict format for JSON-RPC
                     return {
                         "jsonrpc": "2.0",
                         "id": msg_id,
-                        "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
+                        "result": {
+                            "content": [{"type": c.type, "text": c.text} for c in result.content],
+                            "isError": result.isError
+                        }
                     }
             except Exception as e:
                 return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": str(e)}}
