@@ -11,6 +11,9 @@ The Travel Agent MCP Server follows the Model Context Protocol (MCP) architectur
 │                      FastAPI Layer                          │
 │  (HTTP Server, Health, Metrics, SSE Transport)              │
 ├─────────────────────────────────────────────────────────────┤
+│                      FastMCP Layer                           │
+│  (Official FastMCP /mcp endpoint with ASGI transport)      │
+├─────────────────────────────────────────────────────────────┤
 │                      MCP Server Layer                        │
 │  (Protocol Handler, Tool Registry, Request Routing)         │
 ├─────────────────────────────────────────────────────────────┤
@@ -42,6 +45,13 @@ The Travel Agent MCP Server follows the Model Context Protocol (MCP) architectur
 - Implements Server-Sent Events for real-time communication
 - Manages client sessions
 - Handles HTTP POST for client-to-server messages
+
+#### FastMCP Integration
+- Official FastMCP framework integration at `/mcp` endpoint
+- Uses FastMCP's `mount()` pattern for FastAPI integration
+- Direct decorator-based tool registration (`@mcp.tool()`)
+- Reuses existing tool implementations via wrapper functions
+- ASGI-based transport for MCP protocol
 
 ### 3.2 Tool Components
 

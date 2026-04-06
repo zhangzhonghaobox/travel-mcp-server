@@ -1,28 +1,34 @@
 """Main entry point for Travel MCP Server."""
 
 import asyncio
+import json
 import signal
 import sys
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict, Optional
 
 import structlog
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastmcp import FastMCP
 
 from travel_mcp.config import get_config
 from travel_mcp.middleware.logging import LoggingMiddleware
 from travel_mcp.middleware.rate_limit import get_rate_limiter
 from travel_mcp.monitoring.health import HealthChecker
 from travel_mcp.monitoring.metrics import get_metrics_collector
-from travel_mcp.server.mcp_server import create_server
+from travel_mcp.server.mcp_server import create_server, TravelMCPServer
 from travel_mcp.tools.weather import WeatherQueryTool
 from travel_mcp.tools.product import ProductSearchTool
 from travel_mcp.tools.attraction import TouristAttractionSearchTool
 from travel_mcp.tools.hotel import HotelSearchTool
 from travel_mcp.tools.flight import FlightSearchTool
+from travel_mcp.tools.base import ToolExecutionContext
+from travel_mcp.core.security import SecurityValidator
+from travel_mcp.core.permission import Permission, PermissionChecker
+from travel_mcp.core.audit import AuditLogger
 from travel_mcp.core.error_handler import ErrorResponse, ErrorCode
 from travel_mcp.server.sse_transport import SSEServerTransport, get_sse_transport, set_mcp_server
 
@@ -48,9 +54,104 @@ structlog.configure(
 logger = structlog.get_logger("main")
 
 
+# Global server instance for FastMCP tool access
+_fast_mcp_server: Optional[TravelMCPServer] = None
+
+
+def set_fast_mcp_server(server: TravelMCPServer) -> None:
+    """Set the global FastMCP server instance for tool access."""
+    global _fast_mcp_server
+    _fast_mcp_server = server
+
+
+def get_fast_mcp_server() -> TravelMCPServer:
+    """Get the global FastMCP server instance."""
+    if _fast_mcp_server is None:
+        raise RuntimeError("FastMCP server not initialized")
+    return _fast_mcp_server
+
+
+# Create FastMCP server instance
+mcp = FastMCP("Travel MCP Server")
+
+
+async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """
+    Execute a tool with full security checks via the MCP server.
+
+    This delegates to server.call_tool_impl() which applies:
+    - Security validation
+    - Permission checks
+    - Audit logging
+    - Metrics collection
+    """
+    server = get_fast_mcp_server()
+
+    # Delegate to the existing call_tool_impl which has all security infrastructure
+    result = await server.call_tool_impl(tool_name, arguments)
+
+    # Extract the text content from CallToolResult
+    if result.content and len(result.content) > 0:
+        return result.content[0].text
+    return json.dumps({"success": False, "error": "No result content"})
+
+
+# Register tools with FastMCP using decorator pattern
+@mcp.tool(name="weather_query")
+async def weather_query(city: str, date: str | None = None) -> str:
+    """Query weather for a city."""
+    return await execute_tool("weather_query", {"city": city, "date": date})
+
+
+@mcp.tool(name="product_search")
+async def product_search(keywords: str, category: str | None = None, limit: int = 10) -> str:
+    """Search for travel-related products."""
+    return await execute_tool("product_search", {"keywords": keywords, "category": category, "limit": limit})
+
+
+@mcp.tool(name="tourist_attraction_search")
+async def tourist_attraction_search(
+    destination: str,
+    tags: list[str] | None = None,
+    limit: int = 10,
+) -> str:
+    """Search for tourist attractions at a destination."""
+    return await execute_tool("tourist_attraction_search", {"destination": destination, "tags": tags, "limit": limit})
+
+
+@mcp.tool(name="hotel_search")
+async def hotel_search(
+    city: str,
+    check_in_date: str,
+    check_out_date: str,
+    guests: int = 1,
+    limit: int = 10,
+) -> str:
+    """Search for hotels in a city."""
+    return await execute_tool("hotel_search", {"city": city, "check_in_date": check_in_date, "check_out_date": check_out_date, "guests": guests, "limit": limit})
+
+
+@mcp.tool(name="flight_search")
+async def flight_search(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str | None = None,
+    passengers: int = 1,
+    limit: int = 10,
+) -> str:
+    """Search for flights between two locations."""
+    return await execute_tool("flight_search", {"origin": origin, "destination": destination, "departure_date": departure_date, "return_date": return_date, "passengers": passengers, "limit": limit})
+
+
+# Create MCP ASGI app - FastMCP manages its own lifespan
+# path="/" means FastMCP uses root paths internally, then we mount at /mcp
+mcp_app = mcp.http_app(path="/")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan manager."""
+    """Application lifespan manager - combines FastMCP lifespan with our own."""
     config = get_config()
     logger.info(
         "server_starting",
@@ -73,17 +174,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Also set global reference for SSE transport
     set_mcp_server(server)
 
+    # Set global reference for FastMCP tools
+    set_fast_mcp_server(server)
+
     logger.info(
-        "server_started",
+        "server_initialized",
         server_name=config.server_name,
         version=config.version,
-        host=config.host,
-        port=config.port,
     )
 
-    yield
-
-    logger.info("server_shutting_down", server_name=config.server_name)
+    # Now run FastMCP's lifespan to initialize its session manager
+    async with mcp_app.lifespan(app):
+        logger.info(
+            "server_started",
+            server_name=config.server_name,
+            version=config.version,
+            host=config.host,
+            port=config.port,
+        )
+        yield
+        logger.info("server_shutting_down", server_name=config.server_name)
 
 
 def create_app() -> FastAPI:
@@ -224,6 +334,9 @@ def create_app() -> FastAPI:
                 ).model_dump(),
                 status_code=500,
             )
+
+    # Mount FastMCP at /mcp (mounts after other routes to avoid conflicts)
+    app.mount("/mcp", mcp_app)
 
     return app
 
